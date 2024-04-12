@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import ConcatDataset
+from filelock import FileLock
 
 from ultralytics.utils import LOCAL_RANK, NUM_THREADS, TQDM, colorstr
 from ultralytics.utils.ops import resample_segments
@@ -292,7 +293,7 @@ class GroundingDataset(YOLODataset):
         """Loads annotations from a JSON file, filters, and normalizes bounding boxes for each image."""
         labels = []
         LOGGER.info("Loading annotation file...")
-        with open(self.json_file, "r") as f:
+        with open(self.json_file) as f:
             annotations = json.load(f)
         images = {f'{x["id"]:d}': x for x in annotations["images"]}
         imgToAnns = defaultdict(list)
@@ -447,19 +448,43 @@ class ClassificationDataset:
     def __getitem__(self, i):
         """Returns subset of data and targets corresponding to given indices."""
         f, j, fn, im = self.samples[i]  # filename, index, filename.with_suffix('.npy'), image
-        if self.cache_ram:
-            if im is None:  # Warning: two separate if statements required here, do not combine this with previous line
-                im = self.samples[i][3] = cv2.imread(f)
-        elif self.cache_disk:
-            if not fn.exists():  # load npy
-                np.save(fn.as_posix(), cv2.imread(f), allow_pickle=False)
-            im = np.load(fn)
-        else:  # read image
-            im = cv2.imread(f)  # BGR
-        # Convert NumPy array to PIL image
-        im = Image.fromarray(cv2.cvtColor(im, cv2.COLOR_BGR2RGB))
-        sample = self.torch_transforms(im)
-        return {"img": sample, "cls": j}
+        try:
+            if self.cache_ram:
+                if im is None:  # Load from file if not in RAM
+                    im = cv2.imread(f)
+                    if im is None:
+                        raise ValueError(f"Image not loaded properly from {f}.")
+                    self.samples[i][3] = im
+            elif self.cache_disk:
+                if not fn.exists():  # Check if the file does not exist
+                    image = cv2.imread(f)
+                    if image is None or image.size == 0:
+                        raise ValueError(f"Failed to load image from {f}. The image is empty or corrupted.")
+                    lock_path = fn.with_suffix('.lock').as_posix()  # Lock file for synchronization
+                    lock = FileLock(lock_path, timeout=10)
+                    with lock:
+                        np.save(fn.as_posix(), image, allow_pickle=False)
+                # Load the .npy file outside of the lock
+                try:
+                    im = np.load(fn)
+                except Exception as e:
+                    raise ValueError(f"Failed to load npy file {fn}, possibly corrupted: {e}")
+            else:  # Read image directly
+                im = cv2.imread(f)  # BGR
+                if im is None:
+                    raise ValueError(f"Image not loaded properly from {f}.")
+
+            # Convert NumPy array to PIL image
+            if im is not None:
+                im = Image.fromarray(cv2.cvtColor(im, cv2.COLOR_BGR2RGB))
+                sample = self.torch_transforms(im)
+                return {"img": sample, "cls": j}
+            else:
+                raise ValueError("Image data is None.")
+        except Exception as e:
+            print(f"Error processing {f}: {e}")
+            # Handle or re-raise the exception as needed
+            raise e
 
     def __len__(self) -> int:
         """Return the total number of samples in the dataset."""
